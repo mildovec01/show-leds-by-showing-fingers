@@ -1,78 +1,50 @@
-#!/usr/bin/env python3
-import time, re, os, sys
-import serial
-from gpiozero import LED
+from picamera2 import Picamera2
+import RPi.GPIO as GPIO
+import time
 
-# ===== KONFIG =====
-PORT = "/dev/ttyACM0"      # pokud máš jiný, změň
-BAUD = 115200
-DWELL_MS = 200
-LED_PINS = [17, 27, 22]    # 1–3 LED (BCM)
+# --- Nastavení LED ---
+LED1 = 17
+LED2 = 27
 
-# ===== GPIO =====
-leds = [LED(p) for p in LED_PINS]
-def show(n):
-    for i, L in enumerate(leds, start=1):
-        (L.on() if i <= n else L.off())
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(LED1, GPIO.OUT)
+GPIO.setup(LED2, GPIO.OUT)
 
-def main():
-    try:
-        ser = serial.Serial(PORT, BAUD, timeout=0.1)
-        print(f"[INFO] Připojeno k {PORT} @ {BAUD} bps")
-    except Exception as e:
-        print(f"[ERR] Nelze otevřít {PORT}: {e}")
-        sys.exit(1)
+# --- Nastavení kamery IMX500 ---
+picam2 = Picamera2()
+config = picam2.create_preview_configuration(ai={"model": "/usr/share/imx500/models/digits.onnx"})
+picam2.configure(config)
+picam2.start()
 
-    stable = 0
-    last_cand = 0
-    since = time.monotonic()
-    show(stable)
-    print(f"LEDs: {stable}/3 (start)")
+print("Kamera běží, čekám na čísla 1 nebo 2...")
 
-    buf = b""
-    try:
-        while True:
-            chunk = ser.read(128)
-            if not chunk:
-                time.sleep(0.01)
-                continue
+try:
+    while True:
+        result = picam2.ai_results.get()
+        if not result:
+            continue
 
-            buf += chunk
-            if b"\n" not in buf:
-                continue
+        # Výsledek AI je např. {'digit': 1}
+        digit = result.get("digit", None)
+        if digit == 1:
+            GPIO.output(LED1, True)
+            GPIO.output(LED2, False)
+            print("Rozpoznáno číslo 1 → LED1 svítí")
+        elif digit == 2:
+            GPIO.output(LED1, True)
+            GPIO.output(LED2, True)
+            print("Rozpoznáno číslo 2 → LED1 a LED2 svítí")
+        else:
+            GPIO.output(LED1, False)
+            GPIO.output(LED2, False)
 
-            lines = buf.split(b"\n")
-            buf = lines[-1]
-            for raw in lines[:-1]:
-                line = raw.decode("utf-8", errors="ignore").strip()
-                if not line:
-                    continue
-                # hledáme "Num:X"
-                m = re.search(r'Num[:=]\s*(\d)', line, re.IGNORECASE)
-                if not m:
-                    continue
-                d = int(m.group(1))
-                candidate = d if d in (1,2,3) else 0
+        time.sleep(0.1)
 
-                now = time.monotonic()
-                if candidate != last_cand:
-                    last_cand = candidate
-                    since = now
-                else:
-                    if (now - since)*1000 >= DWELL_MS and stable != last_cand:
-                        stable = last_cand
-                        show(stable)
-                        print(f"LEDs: {stable}/3")
+except KeyboardInterrupt:
+    pass
 
-    except KeyboardInterrupt:
-        pass
-    finally:
-        show(0)
-        try: ser.close()
-        except: pass
-        print("Bye.")
-
-if __name__ == "__main__":
-    main()
+finally:
+    GPIO.cleanup()
+    picam2.stop()
 
 
