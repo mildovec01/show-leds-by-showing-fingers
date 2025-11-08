@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+#!/usr/bin/env python3
 import time
 from collections import deque
 import math
@@ -111,5 +112,90 @@ try:
         frame = picam.capture_array()   # RGB
         if FLIP:
             frame = cv2.flip(frame, 1)
-        H,
+        H, W = frame.shape[:2]
+
+        # 1) Najdi ROI (nejdřív reuse, pak skin fallback)
+        #    a) zkuste použít poslední ROI (rychlejší, méně šumu)
+        if last_roi is not None:
+            x,y,w,h = last_roi
+            x_m = clamp(x-ROI_MARGIN, 0, W-1)
+            y_m = clamp(y-ROI_MARGIN, 0, H-1)
+            w_m = clamp(w+2*ROI_MARGIN, 1, W-x_m)
+            h_m = clamp(h+2*ROI_MARGIN, 1, H-y_m)
+            roi_img, (rx,ry,rw,rh) = safe_crop(frame, x_m, y_m, w_m, h_m)
+        else:
+            # b) fallback: hrubá skin detekce přes celý snímek
+            bb = biggest_skin_roi(frame)
+            if bb is not None:
+                x,y,w,h = bb
+                x_m = clamp(x-ROI_MARGIN, 0, W-1)
+                y_m = clamp(y-ROI_MARGIN, 0, H-1)
+                w_m = clamp(w+2*ROI_MARGIN, 1, W-x_m)
+                h_m = clamp(h+2*ROI_MARGIN, 1, H-y_m)
+                roi_img, (rx,ry,rw,rh) = safe_crop(frame, x_m, y_m, w_m, h_m)
+            else:
+                # nic rozumného – podrž aktuální stav, žádná změna kandidáta
+                # (neblikáme při ztrátě ruky)
+                # krátká pauza a pokračuj
+                time.sleep(0.01)
+                continue
+
+        # 2) MediaPipe inference jen na ROI (když je k dispozici)
+        detected_fingers = None
+        if MP_AVAILABLE and hands is not None:
+            results = hands.process(roi_img)
+            if results.multi_hand_landmarks:
+                lms = results.multi_hand_landmarks[0]
+                label = "Right"
+                if results.multi_handedness:
+                    label = results.multi_handedness[0].classification[0].label
+                # spočítej prsty
+                fingers_0_5 = count_fingers_from_landmarks(lms, label)
+                detected_fingers = fingers_0_5
+                # z landmarků odhadni bounding box a aktualizuj last_roi
+                xs = [pt.x for pt in lms.landmark]
+                ys = [pt.y for pt in lms.landmark]
+                if xs and ys:
+                    xmin = int(min(xs)*rw) + rx
+                    xmax = int(max(xs)*rw) + rx
+                    ymin = int(min(ys)*rh) + ry
+                    ymax = int(max(ys)*rh) + ry
+                    # validace velikosti
+                    if (xmax-xmin)*(ymax-ymin) >= MIN_HAND_AREA:
+                        last_roi = (clamp(xmin,0,W-1), clamp(ymin,0,H-1),
+                                    clamp(xmax-xmin,1,W), clamp(ymax-ymin,1,H))
+        else:
+            # Fallback: když MP není dostupné, použij skin ROI jako přítomnost ruky → drž poslední stav
+            # (Doporučeno mít MP; fallback je jen nouzovka.)
+            detected_fingers = None
+
+        # 3) Kandidát (0–MAX_FINGERS)
+        if detected_fingers is None:
+            # Bez nové hodnoty – nechej kandidáta beze změny, jen drobné zpomalení
+            time.sleep(0.01)
+            continue
+
+        candidate = clamp(detected_fingers, 0, MAX_FINGERS)
+
+        # 4) Dwell + hysteréze: potvrdíme až když drží DWELL_MS
+        now = time.monotonic()
+        if candidate != last_candidate:
+            last_candidate = candidate
+            candidate_since = now
+        else:
+            if (now - candidate_since) * 1000 >= DWELL_MS and stable_count != last_candidate:
+                stable_count = last_candidate
+                show_count(stable_count)
+                print(f"LEDs: {stable_count}/{MAX_FINGERS}")
+
+        time.sleep(0.005)
+
+except KeyboardInterrupt:
+    pass
+finally:
+    show_count(0)
+    if MP_AVAILABLE and hands is not None:
+        hands.close()
+    picam.stop()
+    print("Bye.")
 
