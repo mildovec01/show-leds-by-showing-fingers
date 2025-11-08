@@ -1,101 +1,130 @@
 #!/usr/bin/env python3
-import time
+import time, math
+from collections import deque
+import numpy as np
+import cv2
 from gpiozero import LED
 from picamera2 import Picamera2
-import mediapipe as mp
-import cv2  # jen kvůli flipu, nic nezobrazuju
 
 # ===== KONFIG =====
-LED_PINS = [17, 27, 22]   # 1–3 prsty -> 3 LED
-RES = (960, 540)          # kompromis rychlost/kvalita
-FLIP = True               # zrcadlení (self-view)
-DWELL_MS = 300            # změnu potvrdím až když drží >= 300 ms
-MAX_FINGERS = 3           # kolik LED reálně máme (ořízne 4–5 na 3)
-DET_CONF = 0.5            # prahy detekce/tracking
-TRK_CONF = 0.5
+LED_PINS = [17, 27, 22]       # 1–3 prsty
+RES = (960, 540)
+FLIP = True
+MIN_AREA = 9000               # min. plocha ruky (px)
+MAX_MOVE = 35                 # max. posun středu ROI mezi snímky (px) – když víc, neaktualizujeme (stabilita)
+DEPTH_MIN = 1200              # min. hloubka defektu (ostrá „V“ mezi prsty)
+ANGLE_MAX = 80                # max. úhel ve far-point (ostřejší = prst)
+MEDIAN_WIN = 7                # okno na medián (liché)
+DWELL_MS = 300                # nová hodnota musí držet
+PRINT_CHANGES = True
 
 # ===== GPIO =====
 leds = [LED(p) for p in LED_PINS]
 def show_count(n: int):
-    for i, led in enumerate(leds, start=1):
-        (led.on() if i <= n else led.off())
+    for i, L in enumerate(leds, start=1):
+        (L.on() if i <= n else L.off())
 
-# ===== MediaPipe helpers =====
-def count_fingers_from_landmarks(lms, handed_label: str) -> int:
-    """
-    5-prstová logika (MediaPipe Hands):
-      - ukazováček..malík: tip.y < pip.y
-      - palec: Right => tip.x < mcp.x, Left => tip.x > mcp.x
-    """
-    lm = lms.landmark  # DŮLEŽITÉ: přístup přes .landmark
-    tips = [8, 12, 16, 20]
-    pips = [6, 10, 14, 18]
+# ===== Pomocné =====
+KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))
+LOWER1 = np.array([0, 25, 40]);  UPPER1 = np.array([20, 200, 255])
+LOWER2 = np.array([160,25, 40]); UPPER2 = np.array([179,200, 255])
+
+def skin_mask(rgb):
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    m = cv2.inRange(hsv, LOWER1, UPPER1) | cv2.inRange(hsv, LOWER2, UPPER2)
+    m = cv2.medianBlur(m, 5)
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, KERNEL, iterations=1)
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, KERNEL, iterations=2)
+    return m
+
+def biggest_contour(mask):
+    cnts,_ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts: return None
+    c = max(cnts, key=cv2.contourArea)
+    if cv2.contourArea(c) < MIN_AREA: return None
+    return c
+
+def count_fingers(cnt):
+    hull = cv2.convexHull(cnt, returnPoints=False)
+    if hull is None or len(hull) < 3: return 0
+    defects = cv2.convexityDefects(cnt, hull)
+    if defects is None: return 0
+
     fingers = 0
-    for tip, pip in zip(tips, pips):
-        if lm[tip].y < lm[pip].y:
+    for i in range(defects.shape[0]):
+        s,e,f,d = defects[i,0]
+        a = np.linalg.norm(cnt[e][0]-cnt[s][0])
+        b = np.linalg.norm(cnt[f][0]-cnt[s][0])
+        c = np.linalg.norm(cnt[e][0]-cnt[f][0])
+        if b*c == 0: 
+            continue
+        cosA = (b*b + c*c - a*a) / (2*b*c)
+        cosA = np.clip(cosA, -1.0, 1.0)
+        angle = math.degrees(math.acos(cosA))
+        if angle < ANGLE_MAX and d > DEPTH_MIN:
             fingers += 1
-    # palec
-    thumb_tip = lm[4]; thumb_mcp = lm[2]
-    if handed_label == "Right":
-        if thumb_tip.x < thumb_mcp.x:
-            fingers += 1
-    else:
-        if thumb_tip.x > thumb_mcp.x:
-            fingers += 1
-    return fingers
+    # defekty ~ mezery -> prstů ~ defekty+1, omezíme na 0–3
+    return max(0, min(3, fingers + 1))
 
-def clamp(v, a, b): return a if v < a else (b if v > b else v)
+def centroid(cnt):
+    M = cv2.moments(cnt)
+    if M["m00"] == 0: return None
+    return (int(M["m10"]/M["m00"]), int(M["m01"]/M["m00"]))
 
 # ===== Kamera =====
-picam = Picamera2()
-picam.configure(picam.create_preview_configuration(main={"size": RES, "format": "RGB888"}))
-picam.start()
-time.sleep(0.2)
+p = Picamera2()
+p.configure(p.create_preview_configuration(main={"size": RES, "format": "RGB888"}))
+p.start(); time.sleep(0.2)
 
-# ===== MediaPipe =====
-mp_hands = mp.solutions.hands
-hands = mp_hands.Hands(static_image_mode=False,
-                       max_num_hands=1,
-                       min_detection_confidence=DET_CONF,
-                       min_tracking_confidence=TRK_CONF)
-
-# ===== Stabilizace: dwell + hysteréze =====
+median_buf = deque(maxlen=MEDIAN_WIN)
 stable = 0
-last_candidate = 0
-since = time.monotonic()
-show_count(stable)
-print(f"LEDs: {stable}/{MAX_FINGERS} (start)")
+last_output = 0
+last_change_t = time.monotonic()
+last_centroid = None
 
-print("Running headless. Ctrl+C to stop.")
+show_count(stable)
+if PRINT_CHANGES: print(f"LEDs: {stable}/3 (start)")
+
 try:
     while True:
-        frame = picam.capture_array()  # RGB
-        if FLIP:
-            frame = cv2.flip(frame, 1)
+        frame = p.capture_array()
+        if FLIP: frame = cv2.flip(frame, 1)
 
-        res = hands.process(frame)
+        mask = skin_mask(frame)
+        cnt = biggest_contour(mask)
+        if cnt is None:
+            # žádná ruka -> držíme, jen resetujeme median buffer (ať nenosí starý mód)
+            median_buf.clear()
+            time.sleep(0.01)
+            continue
 
-        if res.multi_hand_landmarks:
-            lms = res.multi_hand_landmarks[0]
-            label = "Right"
-            if res.multi_handedness:
-                label = res.multi_handedness[0].classification[0].label
+        # gate: ruka se nesmí moc hýbat (omezíme na malé posuny)
+        c = centroid(cnt)
+        if c and last_centroid:
+            if abs(c[0]-last_centroid[0]) > MAX_MOVE or abs(c[1]-last_centroid[1]) > MAX_MOVE:
+                # velký pohyb -> neaktualizuj (drž poslední stabilní)
+                time.sleep(0.01)
+                continue
+        if c: last_centroid = c
 
-            count_0_5 = count_fingers_from_landmarks(lms, label)
-            candidate = clamp(count_0_5, 0, MAX_FINGERS)
-        else:
-            # žádná ruka -> držíme poslední stabilní stav (neblikáme)
-            candidate = stable
+        # spočítej prsty pro aktuální snímek
+        curr = count_fingers(cnt)
+        median_buf.append(curr)
 
+        # robustní kandidát: medián z posledních N
+        med = int(np.median(median_buf)) if median_buf else stable
+
+        # dwell + hysteréze
         now = time.monotonic()
-        if candidate != last_candidate:
-            last_candidate = candidate
-            since = now
+        if med != last_output:
+            last_output = med
+            last_change_t = now
         else:
-            if (now - since) * 1000 >= DWELL_MS and stable != last_candidate:
-                stable = last_candidate
+            if (now - last_change_t) * 1000 >= DWELL_MS and stable != last_output:
+                stable = last_output
                 show_count(stable)
-                print(f"LEDs: {stable}/{MAX_FINGERS}")
+                if PRINT_CHANGES:
+                    print(f"LEDs: {stable}/3")
 
         time.sleep(0.005)
 
@@ -103,6 +132,5 @@ except KeyboardInterrupt:
     pass
 finally:
     show_count(0)
-    hands.close()
-    picam.stop()
+    p.stop()
     print("Bye.")
